@@ -2,7 +2,7 @@
     "name": "RedCore",
     "version": "0.0.0",
     "description": "A framework for distributed Node.js application using Redis",
-    "main": "index.js",
+    "main": "redcore.js",
     "scripts": {
         "test": "echo \"Error: no test specified\" && exit 1"
     },

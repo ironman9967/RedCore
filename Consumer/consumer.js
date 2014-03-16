@@ -6,10 +6,16 @@ var IdHelper = require('./../Helpers/IdHelper');
 
 var Consumer = require('./Classes/Consumer');
 
-exports.createConsumer = function (opts) {
-    var c = new Consumer(OptionsHelper.Validate({
+exports.createConsumer = function (opts, callback) {
+    if (typeof opts === "function" && _.isUndefined(callback)) {
+        callback = opts;
+        opts = {};
+    }
+    var c = new Consumer(process.env.REDCORE_PORT, process.env.REDCORE_HOST, OptionsHelper.Validate({
         id: "Consumer" + IdHelper.GetId(7),
-        applicationId: "Application" + IdHelper.GetId(7)
+        applicationId: "Application" + IdHelper.GetId(7),
+        redisPort: process.env.REDCORE_PORT,
+        redisHost: process.env.REDCORE_HOST
     }, opts));
 
     c.needSkillSet = function (skillSet, opts, callback) {
@@ -24,8 +30,8 @@ exports.createConsumer = function (opts) {
         });
     };
 
-    c.doneWithSkillSet = function (skillSet) {
-        c.DoneWithSkillSet(skillSet);
+    c.doneWithSkillSet = function (skillSet, callback) {
+        c.DoneWithSkillSet(skillSet, callback);
     };
 
     c.postJob = function (skillSet, skillName, parameters, callback) {
@@ -44,6 +50,10 @@ exports.createConsumer = function (opts) {
         else {
             c.emit.apply(c, ([ 'postJob' ]).concat(args));
         }
+    };
+
+    c.dispose = function () {
+        c.emit('dispose');
     };
 
     return c;

@@ -18,12 +18,12 @@ worker.goToWork(function (callback) {
 worker.skill(knownSkillSet, 'awesomeMethod1', function (awesomeArgs, callback) {
     awesomeArgs.moreAwesome = true;
     //TODO add error mechanism to start clean up
-    callback(awesomeArgs);
+    callback(void 0, awesomeArgs);
 });
 
 worker.skill(knownSkillSet, 'awesomeMethod2', function (awesomeArgs, callback) {
     //echo args cause they're so awesome
-    callback(awesomeArgs);
+    callback(void 0, awesomeArgs);
 });
 
 worker.takeBreak(function (callback) {

@@ -69,12 +69,12 @@ Recruiter.prototype._hireWorkers = function (callback) {
                             console.log("Hired worker(s) for skill set: " + neededSkillSet);
                         }
                     });
-                    callback(hiredWorkers);
+                    callback(void 0, hiredWorkers);
                 }
             });
     }
     else {
-        callback({});
+        callback(void 0, {});
     }
 };
 Recruiter.prototype._recruit = function (callback) {

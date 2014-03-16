@@ -1,6 +1,5 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="testConsumer" type="NodeJSConfigurationType" factoryName="Node.js" singleton="true" path-to-node="/usr/bin/node" path-to-js-file="testConsumer.js" working-dir="$PROJECT_DIR$">
-    <browser start="false" url="" with-js-debugger="false" />
     <RunnerSettings RunnerId="NodeJS.debug" />
     <RunnerSettings RunnerId="NodeJS.run" />
     <ConfigurationWrapper RunnerId="NodeJS.debug" />

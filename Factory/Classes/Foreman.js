@@ -2,38 +2,40 @@
 var util = require('util');
 
 var _ = require('lodash');
-var redis = require('redis');
 
 var Eventer = require('../../BaseClasses/Eventer');
 
-var OptionsHelper = require('../../Helpers/OptionsHelper');
 var RedCoreHelper = require('../../Helpers/RedCoreHelper');
 
+var ErrorHandler = require('./ErrorHandler');
 var Recruiter = require('./Recruiter');
 
-function Foreman(args) {
+function Foreman(workerFiles, options) {
 	if ((this instanceof Foreman) === false) {
-		return new Foreman(args);
+		return new Foreman(workerFiles, options);
 	}
 	Eventer.call(this);
 	this._eventer = Eventer.prototype;
 
-    this._options = {};
-    this._workerFiles = [];
+    this._redisClient = void 0;
+
+    this._options = options;
+    this._workerFiles = workerFiles;
     this._workers = [];
 
-	this._setupEvents();
-    this._parseArgs(args);
-
-    this._options = OptionsHelper.Validate({
-        WorkerWaitForJobTimeoutInSeconds: 10
-    }, this._options);
-
     this._recruiter = void 0;
+    this._errorHandler = void 0;
 
     this._workTimeout = void  0;
+
+    this._initErrorHandler();
+	this._setupEvents();
 }
 util.inherits(Foreman, Eventer);
+
+Foreman.prototype._initErrorHandler = function () {
+    this._errorHandler = new ErrorHandler(true);
+};
 
 Foreman.prototype._setupEvents = function () {
 	this._eventer._setupEvents.call(this);
@@ -43,26 +45,22 @@ Foreman.prototype._setupEvents = function () {
     });
 };
 
-Foreman.prototype._parseArgs = function (args) {
-    while (args.length > 0) {
-        var arg = args.pop();
-        if (arg.indexOf('.js') > 0) {
-            this._workerFiles.push(arg);
-        }
-        //TODO: ARE THERE ANY?
-//        else if (arg.indexOf('-') === 0) {
-//            var flag = arg.substring(1);
-//        }
-        else if (arg.indexOf('=') > 0) {
-            this._options[arg.substring(0, arg.indexOf('='))] = arg.substring(arg.indexOf('=') + 1);
-        }
-    }
-};
-
 Foreman.prototype._startWork = function () {
     this._requireWorkerFiles();
-    this._initRecruiter();
-    this._work();
+    var instance = this;
+    RedCoreHelper.GetClient(this._options.redisPort, this._options.redisHost, {
+        connect_timeout: this._options.redisConnectionTimeoutInSeconds * 1000
+    }, function (error, redisClient) {
+        if (_.isUndefined(error)) {
+            instance._redisClient = redisClient;
+            instance._initRecruiter();
+            instance._work();
+        }
+        else {
+            instance._errorHandler.emit('handle', error, void 0, void 0,
+                instance._options.redisConnectionLogFilePath);
+        }
+    });
 };
 
 Foreman.prototype._requireWorkerFiles = function () {
@@ -74,65 +72,64 @@ Foreman.prototype._requireWorkerFiles = function () {
 };
 
 Foreman.prototype._initRecruiter = function () {
-    this._recruiter = new Recruiter(redis.createClient(), this._workers);
+    this._recruiter = new Recruiter(this._redisClient, this._workers);
 };
 
 Foreman.prototype._work = function () {
     var instance = this;
-    this._recruiter.emit('recruit', function (hiredWorkers) {
-        var keys = [];
-        console.log("Working " + (_.isUndefined(hiredWorkers) ? 0
-            : _.keys(hiredWorkers).length) + " workers");
-        _.each(hiredWorkers, function (workers, skillSet) {
-            _.each(_.uniq(_.pluck(workers, '_applicationId')), function (applicationId) {
-                keys.push(RedCoreHelper.BuildRedCoreKey({
-                    application: applicationId,
-                    skillSet: skillSet,
-                    jobs: ""
-                }));
-                console.log("Going to look for a job using skill set " + skillSet + " for the "
-                    + applicationId + " application");
+    this._recruiter.emit('recruit', function (error, hiredWorkers) {
+        if (!_.isUndefined(error)) {
+            instance._errorHandler.emit('handle', error, "Factory", instance._redisClient,
+                instance._options.redisConnectionLogFilePath)
+        }
+        else {
+            var keys = [];
+            console.log("Working " + (_.isUndefined(hiredWorkers) ? 0
+                : _.keys(hiredWorkers).length) + " workers");
+            _.each(hiredWorkers, function (workers, skillSet) {
+                _.each(_.uniq(_.pluck(workers, '_applicationId')), function (applicationId) {
+                    keys.push(RedCoreHelper.BuildRedCoreKey({
+                        application: applicationId,
+                        skillSet: skillSet,
+                        jobs: ""
+                    }));
+                    console.log("Going to look for a job using skill set " + skillSet + " for the "
+                        + applicationId + " application");
+                });
             });
-        });
-        if (keys.length > 0) {
-            var redisClient = redis.createClient();
-            console.log("Popping job for one of the hired workers");
-            RedCoreHelper.CallMethodWithMultipleKeys(redisClient, 'brpop', keys,
-                [ instance._options.WorkerWaitForJobTimeoutInSeconds ], function (brpopError, jobInfo) {
-                    if (brpopError !== null) {
-                        redisClient.quit();
-                        //TODO
-                        console.error(brpopError);
-                    }
-                    else if (jobInfo === null) {
-                        console.log("Pop job timed out, trying again");
-                        redisClient.quit();
-                        instance._work();
-                    }
-                    else {
-                        var job = JSON.parse(jobInfo[1]);
-                        RedCoreHelper.GetTime(redisClient, function (error, time) {
-                            if (!_.isUndefined(error)) {
-                                //TODO
-                                console.error(error);
-                            }
-                            else {
-                                job.skillSet = RedCoreHelper.GetRedCoreKeyElement(jobInfo[0], 'SkillSet');
-                                var worker = _.sample(hiredWorkers[job.skillSet], 1)[0];
-                                console.log("Job " + job.skillName + " found for worker " + worker._id
-                                    + " using " + job.skillSet);
-                                var workerEvent = 'goToWork';
-                                if (worker._atWork) {
-                                    workerEvent = 'breaksOver';
+            if (keys.length > 0) {
+                console.log("Popping job for one of the hired workers");
+                RedCoreHelper.CallMethodWithMultipleKeys(instance._redisClient, 'brpop', keys,
+                    [ instance._options.workerWaitForJobTimeoutInSeconds ],
+                    function (brpopError, jobInfo) {
+                        if (brpopError !== null) {
+                            instance._errorHandler.emit('handle', brpopError, "Factory",
+                                instance._redisClient, instance._options.redisConnectionLogFilePath);
+                        }
+                        else if (jobInfo === null) {
+                            console.log("Pop job timed out, trying again");
+                            instance._work();
+                        }
+                        else {
+                            var job = JSON.parse(jobInfo[1]);
+                            RedCoreHelper.GetTime(instance._redisClient, function (timeError, time) {
+                                if (!_.isUndefined(timeError)) {
+                                    instance._errorHandler.emit('handle', timeError, "Factory",
+                                        instance._redisClient,
+                                        instance._options.redisConnectionLogFilePath);
                                 }
-                                worker.emit(workerEvent, job, function (product) {
-                                    if (!_.isUndefined(error)) {
-                                        redisClient.quit();
-                                        //TODO
-                                        console.error(error);
+                                else {
+                                    job.skillSet = RedCoreHelper.GetRedCoreKeyElement(jobInfo[0],
+                                        'SkillSet');
+                                    var worker = _.sample(hiredWorkers[job.skillSet], 1)[0];
+                                    console.log("Job " + job.skillName + " found for worker " + worker._id
+                                        + " using " + job.skillSet);
+                                    var workerEvent = 'goToWork';
+                                    if (worker._atWork) {
+                                        workerEvent = 'breaksOver';
                                     }
-                                    else {
-                                        console.log("Pushing " + job.skillName + " product to redis");
+                                    worker.emit(workerEvent, job, function (productError, product) {
+                                        var productString = "";
                                         var meta = {
                                             application: worker._applicationId,
                                             needSkillSet: job.skillSet,
@@ -141,18 +138,26 @@ Foreman.prototype._work = function () {
                                             workedBy: worker._id,
                                             msToComplete: time - job.created
                                         };
-                                        redisClient.publish(RedCoreHelper.BuildRedCoreKey({
+                                        if (!_.isUndefined(productError)) {
+                                            console.log("Pushing " + job.skillName + " error to redis");
+                                            productString = JSON.stringify([ productError ]);
+                                        }
+                                        else {
+                                            console.log("Pushing " + job.skillName + " product to redis");
+                                            productString = JSON.stringify([ void 0, product, meta ]);
+                                        }
+                                        instance._redisClient.publish(RedCoreHelper.BuildRedCoreKey({
                                             application: worker._applicationId,
                                             consumer: job.consumer,
                                             needSkillSet: job.skillSet,
                                             skillName: job.skillName,
                                             jobId: job.jobId,
                                             product: ""
-                                        }), JSON.stringify([ product, meta ]), function (error) {
-                                            redisClient.quit();
-                                            if (error !== null) {
-                                                //TODO
-                                                console.error(error);
+                                        }), productString, function (publishError) {
+                                            if (publishError !== null) {
+                                                instance._errorHandler.emit('handle', publishError,
+                                                    worker._applicationId, instance._redisClient,
+                                                    instance._options.redisConnectionLogFilePath);
                                             }
                                             else {
                                                 console.log("Worker finished queueing job " +
@@ -162,25 +167,26 @@ Foreman.prototype._work = function () {
                                                 });
                                             }
                                         });
-                                    }
-                                });
-                            }
-                        });
-                    }
-                });
-        }
-        else {
-            setTimeout(function () {
-                instance._work();
-            }, instance._options.WorkerWaitForJobTimeoutInSeconds * 1000);
-            console.log("Didn't find any needed skill sets for hired workers, trying again in "
-                + instance._options.WorkerWaitForJobTimeoutInSeconds + " second(s)");
+                                    });
+                                }
+                            });
+                        }
+                    });
+            }
+            else {
+                setTimeout(function () {
+                    instance._work();
+                }, instance._options.workerWaitForJobTimeoutInSeconds * 1000);
+                console.log("Didn't find any needed skill sets for hired workers, trying again in "
+                    + instance._options.workerWaitForJobTimeoutInSeconds + " second(s)");
+            }
         }
     });
 };
 
 Foreman.prototype._dispose = function () {
     clearTimeout(this._workTimeout);
+    this._redisClient.quit();
 	this._eventer._dispose.call(this);
 };
 

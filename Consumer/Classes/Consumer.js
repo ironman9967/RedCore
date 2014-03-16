@@ -2,36 +2,67 @@
 var util = require('util');
 
 var _ = require('lodash');
-var redis = require('redis');
 
 var Eventer = require('../../BaseClasses/Eventer');
 
 var IdHelper = require('../../Helpers/IdHelper');
 var RedCoreHelper = require('../../Helpers/RedCoreHelper');
 
-function Consumer(options) {
+function Consumer(options, callback) {
     if ((this instanceof Consumer) === false) {
-        return new Consumer(options);
+        return new Consumer(options, callback);
     }
     Eventer.call(this);
     this._eventer = Eventer.prototype;
 
     this._id = options.id;
     this._applicationId = options.applicationId;
+    this._redisPort = options.redisPort;
+    this._redisHost = options.redisHost;
+    this._redisConnectionTimeoutInSeconds = options.redisConnectionTimeoutInSeconds;
     this._neededSkillSets = {};
+    this._pendingJobs = {};
 
-    this._jobClient = redis.createClient();
-    this._subscriberClient = redis.createClient();
-
+    this._initClients(callback);
     this._setupEvents();
 }
 util.inherits(Consumer, Eventer);
+
+Consumer.prototype._initClients = function (callback) {
+    var instance = this;
+    RedCoreHelper.GetClient(this._redisPort, this._redisHost, {
+        connect_timeout: this._redisConnectionTimeoutInSeconds * 1000
+    }, function (error, redisClient) {
+        if (!_.isUndefined(error)) {
+            callback(error);
+        }
+        else {
+            instance._jobClient = redisClient;
+            RedCoreHelper.GetClient(instance._redisPort, instance._redisHost, {
+                connect_timeout: instance._redisConnectionTimeoutInSeconds * 1000
+            }, function (error, redisClient) {
+                if (!_.isUndefined(error)) {
+                    callback(error);
+                }
+                else {
+                    instance._subscriberClient = redisClient;
+                    instance.emit('ready');
+                }
+            });
+        }
+    });
+};
 
 Consumer.prototype._setupEvents = function () {
     this._eventer._setupEvents.call(this);
     var instance = this;
     this.on('postJob', function () {
         instance._postJob.apply(instance, arguments);
+    });
+    this.once('ready', function () {
+        instance._subscriberClient.on('message', function (channel, productJSON) {
+            instance._finishedProduct.apply(instance, arguments);
+        });
     });
 };
 
@@ -48,15 +79,28 @@ Consumer.prototype.NeedSkillSet = function (skillSet, opts, callback) {
             callback(saddError);
         }
         else {
-            callback(void 0);
+            callback();
         }
     });
 };
 Consumer.prototype.HasBeenNeeded = function (skillSet) {
     return _.indexOf(_.keys(this._neededSkillSets), skillSet) >= 0;
 };
-Consumer.prototype.DoneWithSkillSet = function (type) {
-    //TODO
+Consumer.prototype.DoneWithSkillSet = function (skillSet, callback) {
+    this._jobClient.srem(RedCoreHelper.BuildRedCoreKey({
+        application: this._applicationId,
+        neededSkillSets: ""
+    }), JSON.stringify({
+        consumer: this._id,
+        skillSet: skillSet
+    }), function (sremError) {
+        if (sremError !== null) {
+            callback(sremError);
+        }
+        else {
+            callback();
+        }
+    });
 };
 
 Consumer.prototype._postJob = function (skillSet, skillName, parameters, callback) {
@@ -75,55 +119,84 @@ Consumer.prototype._postJob = function (skillSet, skillName, parameters, callbac
             skillSet: skillSet,
             jobs: ""
         });
-        instance._jobClient.lpush(jobListKey, job, function (lpushError) {
-            if (lpushError !== null) {
-                callback(lpushError);
-            }
-            else {
-                var timeout = void 0;
-                instance._subscriberClient.once('message', function (channel, productJSON) {
-                    var product = JSON.parse(productJSON);
-                    clearTimeout(timeout);
-                    callback(void 0, product[0], product[1]);
-                });
-                var channel = RedCoreHelper.BuildRedCoreKey({
-                    application: instance._applicationId,
-                    consumer: instance._id,
-                    needSkillSet: skillSet,
-                    skillName: skillName,
-                    jobId: jobId,
-                    product: ""
-                });
-                instance._subscriberClient.subscribe(channel, function (error) {
-                    if (error !== null) {
-                        callback(error);
-                    }
-                    else {
-                        timeout = setTimeout(function () {
-                            instance._subscriberClient.unsubscribe(channel, function (error) {
-                                if (error !== null) {
-                                    //TODO
-                                    console.error(error);
-                                }
-                                else {
-                                    instance._jobClient.lrem(jobListKey, 0, job,
-                                        function (error, removed) {
-                                            if (error !== null) {
-                                                //TODO
-                                                console.error(error);
-                                            }
-                                            else {
-                                                //TODO
-                                                callback("Timed out: " + removed);
-                                            }
-                                        });
-                                }
-                            });
-                        }, instance._neededSkillSets[skillSet].timeout * 1000);
-                    }
-                });
-            }
+        instance._pushJob(job, jobListKey, function (error) {
+            var channel = RedCoreHelper.BuildRedCoreKey({
+                application: instance._applicationId,
+                consumer: instance._id,
+                needSkillSet: skillSet,
+                skillName: skillName,
+                jobId: jobId,
+                product: ""
+            });
+            instance._pendingJobs[jobId] = {
+                timeout: setTimeout(function () {
+                    instance._productTimeout(channel, function (error) {
+                        instance._cancelJob(jobListKey, job, function (error) {
+                            //TODO
+                            callback(error);
+                        });
+                    });
+                }, instance._neededSkillSets[skillSet].timeout * 1000),
+                callback: callback
+            };
+            instance._subscribeToProductChannel(channel, function (error) {
+                if (!_.isUndefined(error)) {
+                    //TODO
+                    console.error(error);
+                }
+            });
         });
+    });
+};
+Consumer.prototype._finishedProduct = function (channel, productJSON) {
+    var product = JSON.parse(productJSON);
+    var jobId = RedCoreHelper.GetRedCoreKeyElement(channel, "JobId");
+    var jobInfo = this._pendingJobs[jobId];
+    clearTimeout(jobInfo.timeout);
+    jobInfo.callback(product[0], product[1], product[2]);
+};
+
+Consumer.prototype._pushJob = function (job, jobListKey, callback) {
+    this._jobClient.lpush(jobListKey, job, function (lpushError) {
+        if (lpushError !== null) {
+            callback(lpushError);
+        }
+        else {
+            callback();
+        }
+    });
+};
+
+Consumer.prototype._subscribeToProductChannel = function (channel, callback) {
+    this._subscriberClient.subscribe(channel, function (error) {
+        if (error !== null) {
+            callback(error);
+        }
+        else {
+            callback();
+        }
+    });
+};
+
+Consumer.prototype._productTimeout = function (channel, callback) {
+    this._subscriberClient.unsubscribe(channel, function (error) {
+        if (error !== null) {
+            callback(error);
+        }
+        else {
+            callback();
+        }
+    });
+};
+
+Consumer.prototype._cancelJob = function (jobListKey, job, callback) {
+    this._jobClient.lrem(jobListKey, 0, job, function (error, removed) {
+        if (error !== null) {
+            callback(error);
+        }
+        else {
+            callback(new Error("Timed out: " + removed));
+        }
     });
 };
 
